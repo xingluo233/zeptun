@@ -93,6 +93,52 @@ typedef struct {
 typedef uint32_t (*zeptun_flow_cb)(void *ctx, const ZeptunFlow *flow);
 typedef void (*zeptun_log_cb)(void *ctx, int level, const char *message, size_t len);
 
+/* One intercepted datagram. Addresses are in network byte order;
+   IPv4 uses the first four bytes of src/dst.
+   payload_off/payload_len locate the UDP payload inside the packet. */
+typedef struct ZeptunUdpMeta {
+    uint8_t family;          /* 4 or 6 */
+    uint8_t src[16];         /* client address */
+    uint8_t dst[16];         /* original destination */
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t payload_off;
+    uint32_t payload_len;
+    char name[256];          /* fake-IP hostname, empty when unknown */
+} ZeptunUdpMeta;
+
+/* Called on a zeptun worker thread. The packet memory is only valid for the
+   duration of the call; copy anything you need to keep.
+   Hand the buffer back with zeptun_send_packet()/zeptun_send_packets(). */
+typedef void (*zeptun_udp_cb)(void *ctx, const uint8_t *packet, size_t len,
+                              const ZeptunUdpMeta *meta);
+
+/* Optional second-stage filter. Called for datagrams whose destination port is
+   not in the intercept list. Return non-zero to take that datagram, zero to
+   leave it on the normal handler path. The classification rule belongs to the
+   embedding application. */
+typedef int (*zeptun_udp_filter_cb)(void *ctx, const uint8_t *packet, size_t len,
+                                    const ZeptunUdpMeta *meta);
+
+/* One intercepted TCP connection. Addresses are in network byte order. */
+typedef struct ZeptunTcpMeta {
+    uint8_t family;          /* 4 or 6 */
+    uint8_t src[16];         /* client address */
+    uint8_t dst[16];         /* original destination */
+    uint16_t src_port;
+    uint16_t dst_port;
+    char name[256];          /* fake-IP hostname, empty when unknown */
+} ZeptunTcpMeta;
+
+/* Called on a zeptun worker thread once the client's connection is set up.
+   sock is a blocking stream socket owned by the host: reading it yields the
+   client's bytes, writing to it sends bytes back. Close it when done. The
+   handle is uintptr_t so it can represent Windows SOCKET as well as POSIX fd.
+   Do not block for long: the callback runs on a worker thread. */
+typedef void (*zeptun_tcp_cb)(void *ctx, const ZeptunTcpMeta *meta, uintptr_t sock);
+
+#define ZEPTUN_UDP_MAX_PORTS 64
+
 typedef struct ZeptunConfig {
     uint32_t struct_size;
     uint32_t preset;
@@ -200,6 +246,22 @@ int zeptun_set_read_callback(Zeptun *tun, zeptun_packets_cb callback, void *ctx)
 int zeptun_set_passthrough_callback(Zeptun *tun, zeptun_packets_cb callback, void *ctx);
 int zeptun_set_protect_callback(Zeptun *tun, zeptun_protect_cb callback, void *ctx);
 int zeptun_set_flow_callback(Zeptun *tun, zeptun_flow_cb callback, void *ctx);
+
+/* UDP interception. Datagrams whose destination port is in the list are
+   handed to the callback instead of being proxied. Pass count == 0 to
+   intercept every UDP port; pass callback == NULL to disable. The callback,
+   filter and port setters must all be called before zeptun_start(). */
+int zeptun_set_udp_callback(Zeptun *tun, zeptun_udp_cb callback, void *ctx);
+int zeptun_set_udp_intercept_ports(Zeptun *tun, const uint16_t *ports, size_t count);
+int zeptun_set_udp_filter_callback(Zeptun *tun, zeptun_udp_filter_cb callback, void *ctx);
+
+/* Stream handoff. Connections whose destination port is in the list are handed
+   to the callback as a socket instead of being proxied. count == 0 takes every
+   port; callback == NULL disables it. Must be called before zeptun_start().
+   TCP handoff requires the userspace TCP stack and is unavailable in system,
+   hybrid or passthrough mode. */
+int zeptun_set_tcp_callback(Zeptun *tun, zeptun_tcp_cb callback, void *ctx);
+int zeptun_set_tcp_intercept_ports(Zeptun *tun, const uint16_t *ports, size_t count);
 int zeptun_set_device_fd(Zeptun *tun, int fd);
 int zeptun_set_adapter_guid(Zeptun *tun, const char *guid);
 
@@ -210,6 +272,13 @@ int zeptun_stop(Zeptun *tun);
 int zeptun_write_packet(Zeptun *tun, const uint8_t *data, size_t len);
 int zeptun_write_packets(Zeptun *tun, const ZeptunPacket *packets, size_t count);
 int zeptun_inject_packets(Zeptun *tun, const ZeptunPacket *packets, size_t count);
+
+/* Write raw IP packets back into the tunnel so the client receives them.
+   Thread safe: callable from any thread, including inside the UDP callback.
+   Unlike zeptun_write_packets() these need an external device; they work with
+   a normal TUN device as long as a UDP intercept callback is installed. */
+int zeptun_send_packet(Zeptun *tun, const uint8_t *data, size_t len);
+int zeptun_send_packets(Zeptun *tun, const ZeptunPacket *packets, size_t count);
 
 int zeptun_network_changed(Zeptun *tun, uint32_t interface_index);
 int zeptun_stats(Zeptun *tun, ZeptunStats *out);

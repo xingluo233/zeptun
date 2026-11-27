@@ -427,6 +427,68 @@ test "segment tcp super packet and verify each segment" {
     }
 }
 
+test "segment UDP GSO into complete datagrams" {
+    const payload_len = 2500;
+    var super: [20 + 8 + payload_len]u8 = @splat(0);
+    const total = super.len;
+    super[0] = 0x45;
+    parse.setBe16(&super, 2, @intCast(total));
+    parse.setBe16(&super, 4, 17);
+    super[8] = 64;
+    super[9] = parse.proto.udp;
+    @memcpy(super[12..16], &[_]u8{ 10, 0, 0, 2 });
+    @memcpy(super[16..20], &[_]u8{ 1, 2, 3, 4 });
+    checksum.ipv4Header(super[0..20]);
+    parse.setBe16(&super, 20, 53000);
+    parse.setBe16(&super, 22, 443);
+    parse.setBe16(&super, 24, @intCast(8 + payload_len));
+    for (super[28..], 0..) |*b, i| b.* = @truncate(i *% 17);
+    const ip = try parse.parseIp(&super);
+    setPartialChecksum(&super, ip, parse.proto.udp, 26);
+
+    var seg = try Segmenter.init(&super, VirtioNetHdr.udp(20, 1000), true);
+    try std.testing.expectEqual(@as(u32, 3), seg.count());
+    var out: [1100]u8 = undefined;
+    var payload_total: usize = 0;
+    var segments: u32 = 0;
+    var next = try seg.next(&out);
+    while (next) |part| {
+        const p = try parse.parse(part);
+        try std.testing.expect(p.l4 == .udp);
+        try std.testing.expect(parse.l4ChecksumValid(part, p));
+        try std.testing.expect(checksum.verifyIpv4Header(part[0..20]));
+        try std.testing.expectEqual(@as(u16, 53000), p.l4.udp.src_port);
+        try std.testing.expectEqual(@as(u16, 443), p.l4.udp.dst_port);
+        payload_total += p.payload_len;
+        segments += 1;
+        next = try seg.next(&out);
+    }
+    try std.testing.expectEqual(@as(u32, 3), segments);
+    try std.testing.expectEqual(@as(usize, payload_len), payload_total);
+}
+
+test "complete UDP partial checksum" {
+    const payload = "udp partial checksum";
+    var pkt: [20 + 8 + payload.len]u8 = @splat(0);
+    const total = pkt.len;
+    pkt[0] = 0x45;
+    parse.setBe16(&pkt, 2, @intCast(total));
+    pkt[8] = 64;
+    pkt[9] = parse.proto.udp;
+    @memcpy(pkt[12..16], &[_]u8{ 10, 0, 0, 2 });
+    @memcpy(pkt[16..20], &[_]u8{ 1, 2, 3, 4 });
+    checksum.ipv4Header(pkt[0..20]);
+    parse.setBe16(&pkt, 20, 53000);
+    parse.setBe16(&pkt, 22, 443);
+    parse.setBe16(&pkt, 24, @intCast(8 + payload.len));
+    @memcpy(pkt[28..], payload);
+    const ip = try parse.parseIp(&pkt);
+    setPartialChecksum(&pkt, ip, parse.proto.udp, 26);
+    try completeChecksum(&pkt, VirtioNetHdr.udp(20, 0));
+    const parsed = try parse.parse(&pkt);
+    try std.testing.expect(parse.l4ChecksumValid(&pkt, parsed));
+}
+
 test "complete partial checksum" {
     var buf: [200]u8 = undefined;
     const pkt = buildTcp(&buf, false, 1, 0x10, "partial checksum data!");

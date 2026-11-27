@@ -411,6 +411,44 @@ pub fn setNonblocking(fd: fd_t) !void {
     if (c.fcntl(fd, c.F.SETFL, flags | nb) < 0) return error.Unexpected;
 }
 
+pub fn setBlocking(fd: fd_t) !void {
+    if (is_windows) return windows.setBlocking(fd);
+    if (is_linux) {
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(flags) != .SUCCESS) return error.Unexpected;
+        const nb: usize = 1 << @bitOffsetOf(linux.O, "NONBLOCK");
+        if (linuxResult(linux.fcntl(fd, linux.F.SETFL, flags & ~nb)) < 0) return error.Unexpected;
+        return;
+    }
+    const flags = c.fcntl(fd, c.F.GETFL);
+    if (flags < 0) return error.Unexpected;
+    const nb: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
+    if (c.fcntl(fd, c.F.SETFL, flags & ~nb) < 0) return error.Unexpected;
+}
+
+/// A connected stream pair. Both ends start non-blocking; the caller decides
+/// whether the handed-out end should stay that way.
+pub fn socketpair() ![2]fd_t {
+    if (is_windows) return windows.socketpair();
+    if (is_linux) {
+        var fds: [2]i32 = undefined;
+        const fl = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+        if (linuxResult(linux.socketpair(linux.AF.UNIX, fl, 0, &fds)) < 0) return error.SystemResources;
+        return fds;
+    }
+    var fds: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return error.SystemResources;
+    errdefer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    for (fds) |fd| {
+        try setNonblocking(fd);
+        if (c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC)) < 0) return error.Unexpected;
+    }
+    return fds;
+}
+
 pub fn setsockopt(fd: fd_t, level: i32, opt: u32, value: []const u8) i32 {
     if (is_linux) return linuxResult(linux.setsockopt(fd, level, opt, value.ptr, @intCast(value.len)));
     if (is_windows) return windows.setsockopt(fd, level, opt, value);

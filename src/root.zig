@@ -13,6 +13,7 @@ pub const log = @import("log.zig");
 pub const queue = @import("queue.zig");
 pub const stats = @import("stats.zig");
 pub const elastic = @import("elastic.zig");
+pub const intercept = @import("intercept.zig");
 
 pub const io = @import("io/io.zig");
 pub const device = @import("device/device.zig");
@@ -49,6 +50,7 @@ test {
     _ = queue;
     _ = stats;
     _ = elastic;
+    _ = intercept;
     _ = io.sys;
     _ = io.file;
     if (io.sys.is_linux) {

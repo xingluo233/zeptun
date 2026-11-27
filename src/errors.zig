@@ -63,7 +63,7 @@ pub fn fromError(err: anyerror) Code {
         error.NotRunning => .not_running,
         error.WouldBlock => .would_block,
         error.NotFound, error.FileNotFound => .not_found,
-        error.LimitExceeded, error.Exhausted, error.Full, error.NoPorts, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .limit_exceeded,
+        error.LimitExceeded, error.Exhausted, error.Full, error.NoPorts, error.TooManyPorts, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .limit_exceeded,
         error.AddressInUse => .address_in_use,
         error.SystemOutdated => .system_outdated,
         error.Closed, error.BrokenPipe, error.ConnectionResetByPeer => .closed,

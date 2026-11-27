@@ -546,6 +546,7 @@ pub fn Tcp(comptime W: type) type {
             }
             c.up.dial.tos = pkt.ip.tos;
             c.up.dial.bypass = bypass;
+            c.up.dial.client = .{ .addr = addr.Address.fromSlice(c.remote[0..al]), .port = c.remote_port };
             w.handler.dialTcp(w, &c.up.dial, c.target, .tcp);
         }
 
@@ -958,6 +959,10 @@ pub fn Tcp(comptime W: type) type {
                         return;
                     }
                     c.state = .established;
+                    // Stream handoff is delivered only after the client's ACK.
+                    if (comptime @hasDecl(@TypeOf(w.handler), "completeStreamHandoff")) {
+                        w.handler.completeStreamHandoff(w, &c.up.dial);
+                    }
                     c.snd_una = th.ack;
                     c.snd_wnd = @as(u32, th.window) << @intCast(c.snd_wscale);
                     c.snd_wl1 = th.seq;
@@ -1485,7 +1490,11 @@ pub fn Tcp(comptime W: type) type {
                 t.tryFree(w, c);
                 return .disarm;
             }
-            if (c.migrating) return .disarm;
+            // A connection that has been handed to another worker keeps its
+            // slot here until the transfer is acknowledged. Cancelled
+            // completions still arrive in between, so both flags must stop
+            // the data path from treating them as an upstream failure.
+            if (c.migrating or c.moved) return .disarm;
             if (result < 0) {
                 t.upstreamData(w, c, result);
                 return .disarm;
@@ -1509,7 +1518,7 @@ pub fn Tcp(comptime W: type) type {
                 t.tryFree(w, c);
                 return .disarm;
             }
-            if (c.migrating and result < 0 and sys.toErrno(result) == .canceled) {
+            if ((c.migrating or c.moved) and result < 0 and sys.toErrno(result) == .canceled) {
                 if (up.rx_buf) |b| w.pool.put(b);
                 up.rx_buf = null;
                 return .disarm;
@@ -1789,6 +1798,9 @@ pub fn Tcp(comptime W: type) type {
                 return;
             }
             const up = &c.up;
+            if (comptime @hasDecl(@TypeOf(w.handler), "cancelStreamHandoff")) {
+                w.handler.cancelStreamHandoff(w, &up.dial);
+            }
             if (up.dial.busy() or up.dial.completionActive() or up.rx_c.isActive() or up.tx_c.isActive()) return;
             if (up.fd != sys.invalid_fd) {
                 w.loop.unregister(up.fd);

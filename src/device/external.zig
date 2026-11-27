@@ -54,12 +54,11 @@ pub const Shared = struct {
     }
 
     pub fn inject(s: *Shared, data: []const u8) InjectError!void {
-        if (s.closed.load(.acquire)) return error.Closed;
-        if (data.len == 0 or data.len > s.input_pool.buffer_size - pool.default_headroom) return error.TooLarge;
+        if (data.len == 0 or data.len > s.mtu) return error.TooLarge;
         s.lock.lock();
-        const maybe = s.input_pool.get();
-        s.lock.unlock();
-        const b = maybe orelse {
+        defer s.lock.unlock();
+        if (s.closed.load(.acquire)) return error.Closed;
+        const b = s.input_pool.get() orelse {
             _ = s.dropped.fetchAdd(1, .monotonic);
             return error.Full;
         };
@@ -71,6 +70,13 @@ pub const Shared = struct {
             return error.Full;
         }
         return;
+    }
+
+    /// Close the injection queue atomically with respect to producers.
+    pub fn close(s: *Shared) void {
+        s.lock.lock();
+        s.closed.store(true, .release);
+        s.lock.unlock();
     }
 
     pub fn injectBatch(s: *Shared, packets: []const Packet) usize {

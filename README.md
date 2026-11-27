@@ -249,12 +249,25 @@ zeptun_destroy(tun);
 | `zeptun_write_packets(tun, packets, count)` | inject packets into the engine |
 | `zeptun_set_protect_callback(tun, cb, ctx)` | approve every upstream socket before it connects |
 | `zeptun_set_flow_callback(tun, cb, ctx)` | decide per flow: proxy, direct, drop or reject |
+| `zeptun_set_udp_callback(tun, cb, ctx)` | take matching UDP datagrams instead of proxying them; configure before start |
+| `zeptun_set_tcp_callback(tun, cb, ctx)` | take matching userspace-TCP connections as a stream socket; configure before start |
+| `zeptun_set_udp_filter_callback(tun, cb, ctx)` | second-stage check for datagrams the port list misses; configure before start |
+| `zeptun_send_packet(s)(tun, ...)` | write raw IP packets back into the tunnel, with typed argument/back-pressure/closed errors |
 | `zeptun_stats(tun, stats)` | lock-free snapshot of the counters |
 | `zeptun_memory(tun, memory)` | packet pool usage and how much memory has been returned to the kernel |
 | `zeptun_network_changed(tun, index)` | tell the engine that the default route moved |
 | `zeptun_strerror(code)` | message for an error code |
 
-Callbacks run on worker threads and must not block. Every setter except `zeptun_stop`, `zeptun_stats`, `zeptun_memory` and the packet functions must be called before `zeptun_start`.
+Callbacks run on worker threads and must not block. All callbacks, filters and
+port lists must be configured before `zeptun_start`; changing them after start
+returns `ZEPTUN_ERR_ALREADY_RUNNING`. The existing per-flow verdict is
+applied first: `drop`, `reject` and `direct` remain effective, and only a
+`proxy` verdict permits handoff selection. UDP GSO handoff is delivered as
+ordinary UDP datagrams after segmentation and partial-checksum completion.
+TCP handoff is available only with the userspace TCP stack; system/hybrid
+configurations reject the setup with `ZEPTUN_ERR_NOT_SUPPORTED`. Inject APIs
+distinguish `ZEPTUN_ERR_INVALID_ARGUMENT`, `ZEPTUN_ERR_WOULD_BLOCK` and
+`ZEPTUN_ERR_CLOSED`. Handoff tests are part of `zig build test`.
 
 ### Kotlin
 
@@ -308,9 +321,9 @@ On iOS take the descriptor from `NEPacketTunnelProvider`, or use `ZEPTUN_DEVICE_
 
 | Mode | TCP | UDP | Notes |
 |---|---|---|---|
-| `userspace` | own terminator | own sessions | works everywhere, keeps no kernel state, required for elastic queues |
-| `system` | kernel sockets behind NAT | kernel sockets | Linux only, lowest CPU for bulk transfer |
-| `hybrid` | kernel NAT with a userspace fallback | own sessions | default where the system stack exists |
+| `userspace` | own terminator | own sessions | works everywhere, keeps no kernel state, required for elastic queues and TCP handoff |
+| `system` | kernel sockets behind NAT | kernel sockets | Linux only, lowest CPU for bulk transfer; TCP handoff is not supported |
+| `hybrid` | kernel NAT with a userspace fallback | own sessions | default where the system stack exists; TCP handoff requires userspace handling |
 
 Elastic queues start with a single worker and add a queue only while it raises throughput, then release it when the load drops. Connections and sessions move between workers without dropping a packet, so the idle footprint stays small on a busy machine.
 
@@ -318,13 +331,13 @@ Elastic queues start with a single worker and add a queue only while it raises t
 
 | Command | Scope |
 |---|---|
-| `zig build test` | unit tests and the deterministic TCP simulation |
+| `zig build test` | unit tests, deterministic TCP simulation, and host handoff tests |
 | `zig build test-netns` | unit tests inside a user and network namespace with real TUN devices |
 | `zig build test-ffi` | `tests/ffi_smoke.c` compiled with `-Wall -Wextra -Werror` against `libzeptun.a` |
 | `zig build test-integration` | 189 end-to-end checks through a real TUN device between two namespaces |
 | `zig build bench` | hot-path microbenchmarks with a regression gate |
 
-Full documentation lives in the [wiki](../../wiki): [Building](../../wiki/Building), [Configuration](../../wiki/Configuration), [Command line](../../wiki/Command-line), [Routing](../../wiki/Routing), [Stacks](../../wiki/Stacks), [C API](../../wiki/C-API), [Android](../../wiki/Android), [Apple](../../wiki/Apple), [Container](../../wiki/Container), [Benchmarks](../../wiki/Benchmarks), [Testing](../../wiki/Testing).
+Full documentation lives in the [wiki](../../wiki): [Building](../../wiki/Building), [Host handoff](../../wiki/Handoff), [Configuration](../../wiki/Configuration), [Command line](../../wiki/Command-line), [Routing](../../wiki/Routing), [Stacks](../../wiki/Stacks), [C API](../../wiki/C-API), [Android](../../wiki/Android), [Apple](../../wiki/Apple), [Container](../../wiki/Container), [Benchmarks](../../wiki/Benchmarks), [Testing](../../wiki/Testing).
 
 The integration suite covers every stack mode, both io backends, one and four queues, direct and SOCKS5, offloads on and off, UDP over TCP, fake-IP, strict routing, auto-redirect, elastic queue rotation under load, and the network namespace mode. The TCP simulation drives the real terminator against a model peer over lossy, reordering links and verifies every byte, leaving no buffers, timers or completions behind.
 

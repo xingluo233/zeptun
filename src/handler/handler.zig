@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config = @import("../config.zig");
+const intercept = @import("../intercept.zig");
 const addr = @import("../addr.zig");
 const sys = @import("../io/sys.zig");
 const io = @import("../io/io.zig");
@@ -29,6 +30,7 @@ pub fn Dial(comptime W: type) type {
         buf: ?*DialBuf(W) = null,
         bypass: bool = false,
         target: addr.Endpoint = .{},
+        client: addr.Endpoint = .{},
         bound: ?addr.Endpoint = null,
         owner: Owner = .tcp,
         phase: Phase = .idle,
@@ -50,6 +52,18 @@ pub fn Dial(comptime W: type) type {
         niov: u8 = 0,
         early_len: u32 = 0,
         early_sent: u32 = 0,
+        handoff_fd: sys.fd_t = sys.invalid_fd,
+        handoff_pending: bool = false,
+        handoff_cb: ?intercept.TcpFn = null,
+        handoff_ctx: ?*anyopaque = null,
+        handoff_meta: intercept.TcpMeta = .{
+            .family = 0,
+            .src = @splat(0),
+            .dst = @splat(0),
+            .src_port = 0,
+            .dst_port = 0,
+            .name = @splat(0),
+        },
 
         pub inline fn busy(d: *const Self) bool {
             return d.phase != .idle and d.phase != .done;
@@ -385,8 +399,19 @@ pub fn Handler(comptime W: type) type {
         }
 
         pub fn dialTcp(h: *Self, w: *W, d: *D, target: addr.Endpoint, owner: Owner) void {
+            if (d.handoff_pending) {
+                if (d.handoff_fd != sys.invalid_fd) sys.close(d.handoff_fd);
+                d.handoff_pending = false;
+                d.handoff_fd = sys.invalid_fd;
+                d.handoff_cb = null;
+                d.handoff_ctx = null;
+            }
             d.owner = owner;
             d.target = target;
+            d.handoff_fd = sys.invalid_fd;
+            d.handoff_pending = false;
+            d.handoff_cb = null;
+            d.handoff_ctx = null;
             d.bound = null;
             d.timed_out = false;
             d.aborted = false;
@@ -420,6 +445,7 @@ pub fn Handler(comptime W: type) type {
                     }
                 }
             }
+            if (owner == .tcp and !d.bypass and h.beginStreamHandoff(w, d, target)) return;
             if (h.socksMode() and !d.bypass and h.warm_size > 0 and owner != .udp) {
                 h.noteDemand(.tcp, w.now());
                 if (h.takeWarm(w, .tcp)) |taken| {
@@ -845,12 +871,105 @@ pub fn Handler(comptime W: type) type {
             if (b.c.isActive()) w.loop.cancel(&b.c);
         }
 
+        /// Give the host a stream socket connected to the client instead of
+        /// opening an upstream connection. Returns true when the connection
+        /// was taken, in which case the dial is already finished.
+        fn beginStreamHandoff(h: *Self, w: *W, d: *D, target: addr.Endpoint) bool {
+            const ic = w.engine.tcpIntercept();
+            if (!ic.match(target.port)) return false;
+            const cb = ic.call orelse return false;
+
+            const pair = sys.socketpair() catch {
+                h.finish(w, d, .mfile);
+                return true;
+            };
+            // Make the host side blocking before registering the engine side.
+            // If this fails, there is no event-loop registration to unwind.
+            sys.setBlocking(pair[1]) catch {
+                sys.close(pair[0]);
+                sys.close(pair[1]);
+                h.finish(w, d, .badf);
+                return true;
+            };
+            w.loop.register(pair[0]) catch {
+                sys.close(pair[0]);
+                sys.close(pair[1]);
+                h.finish(w, d, .badf);
+                return true;
+            };
+            d.fd = pair[0];
+
+            var meta: intercept.TcpMeta = .{
+                .family = if (target.addr.family == .v4) 4 else 6,
+                .src = @splat(0),
+                .dst = @splat(0),
+                .src_port = d.client.port,
+                .dst_port = target.port,
+                .name = @splat(0),
+            };
+            const al: usize = if (target.addr.family == .v4) 4 else 16;
+            @memcpy(meta.src[0..al], d.client.addr.bytes[0..al]);
+            @memcpy(meta.dst[0..al], target.addr.bytes[0..al]);
+            if (h.fake) |tbl| {
+                if (tbl.indexOf(target.addr) != null) {
+                    var buf: [dns.max_name]u8 = @splat(0);
+                    if (tbl.nameOf(target.addr, &buf)) |n| {
+                        const nl = @min(n.len, meta.name.len);
+                        @memcpy(meta.name[0..nl], n[0..nl]);
+                    }
+                }
+            }
+
+            d.handoff_fd = pair[1];
+            d.handoff_pending = true;
+            d.handoff_cb = cb;
+            d.handoff_ctx = ic.ctx;
+            d.handoff_meta = meta;
+            // The callback is deliberately invoked after the client's ACK.
+            h.finish(w, d, .success);
+            return true;
+        }
+
+        /// Complete a pending stream handoff after the client TCP handshake.
+        /// Ownership of handoff_fd moves to the callback before it is invoked.
+        pub fn completeStreamHandoff(h: *Self, w: *W, d: *D) void {
+            _ = h;
+            _ = w;
+            if (!d.handoff_pending) return;
+            const fd = d.handoff_fd;
+            const cb = d.handoff_cb;
+            const ctx = d.handoff_ctx;
+            const meta = d.handoff_meta;
+            d.handoff_pending = false;
+            d.handoff_fd = sys.invalid_fd;
+            d.handoff_cb = null;
+            d.handoff_ctx = null;
+            if (cb) |f| {
+                f(ctx, &meta, @intCast(fd));
+            } else if (fd != sys.invalid_fd) {
+                sys.close(fd);
+            }
+        }
+
+        /// Close a host socket that was not yet handed off.
+        pub fn cancelStreamHandoff(h: *Self, w: *W, d: *D) void {
+            _ = h;
+            _ = w;
+            if (!d.handoff_pending) return;
+            if (d.handoff_fd != sys.invalid_fd) sys.close(d.handoff_fd);
+            d.handoff_pending = false;
+            d.handoff_fd = sys.invalid_fd;
+            d.handoff_cb = null;
+            d.handoff_ctx = null;
+        }
+
         fn finish(h: *Self, w: *W, d: *D, result: sys.Errno) void {
-            if (result == .success) h.proxyHealthy();
+            if (result == .success and !d.handoff_pending) h.proxyHealthy();
             const held = d.buf;
             if (held) |b| w.wheel.cancel(&b.timer);
             if (d.pooled and d.owner != .udp and !h.stopping) h.refill(w);
             if (result != .success) {
+                h.cancelStreamHandoff(w, d);
                 if (d.fd != sys.invalid_fd) {
                     w.loop.unregister(d.fd);
                     sys.close(d.fd);

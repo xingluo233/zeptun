@@ -13,6 +13,7 @@ const dns = @import("dns.zig");
 const handler_mod = @import("../handler/handler.zig");
 const elastic = @import("../elastic.zig");
 const config = @import("../config.zig");
+const intercept = @import("../intercept.zig");
 
 pub fn Udp(comptime W: type) type {
     return struct {
@@ -73,10 +74,112 @@ pub fn Udp(comptime W: type) type {
             u.sessions.deinit(allocator);
         }
 
+        const HandoffResult = enum { none, handled, bypass, proxy };
+
+        fn makeMeta(pkt: parse.Packet, data: []const u8) intercept.Meta {
+            var meta: intercept.Meta = .{
+                .family = if (pkt.ip.isV6()) 6 else 4,
+                .src = @splat(0),
+                .dst = @splat(0),
+                .src_port = pkt.l4.udp.src_port,
+                .dst_port = pkt.l4.udp.dst_port,
+                .payload_off = pkt.payload_off,
+                .payload_len = pkt.payload_len,
+                .name = @splat(0),
+            };
+            const al = pkt.ip.addrLen();
+            @memcpy(meta.src[0..al], pkt.ip.src(data));
+            @memcpy(meta.dst[0..al], pkt.ip.dst(data));
+            return meta;
+        }
+
+        fn classifyAndHandoff(w: *W, pkt: parse.Packet, data: []const u8, by_port: bool) HandoffResult {
+            const ic = w.engine.udpIntercept();
+            const f = ic.call orelse return .none;
+            var meta = makeMeta(pkt, data);
+            if (w.handler.fake) |tbl| {
+                const dst_addr = addr.Address.fromSlice(pkt.ip.dst(data));
+                if (tbl.indexOf(dst_addr) != null) {
+                    var buf: [dns.max_name]u8 = @splat(0);
+                    if (tbl.nameOf(dst_addr, &buf)) |n| {
+                        const nl = @min(n.len, meta.name.len);
+                        @memcpy(meta.name[0..nl], n[0..nl]);
+                    }
+                }
+            }
+
+            // Existing flow policy owns the decision. Host filters are only
+            // consulted after the flow has been allowed to use the proxy path.
+            if (w.judge().active()) {
+                switch (w.judge().ask(parse.proto.udp, pkt.ip.isV6(), pkt.ip.src(data), pkt.l4.udp.src_port, pkt.ip.dst(data), pkt.l4.udp.dst_port)) {
+                    .proxy => {},
+                    .direct => return .bypass,
+                    .drop => return .handled,
+                    .reject => {
+                        icmp.sendUnreachable(w, data, pkt, true);
+                        return .handled;
+                    },
+                }
+            }
+            if (!by_port) {
+                const ff = ic.filter orelse return .proxy;
+                if (ff(ic.filter_ctx, data.ptr, data.len, &meta) == 0) return .proxy;
+            }
+            f(ic.ctx, data.ptr, data.len, &meta);
+            return .handled;
+        }
+
+        /// Copy and complete a single partial-checksum datagram before callback.
+        fn handToHostPartial(w: *W, vh: gso.VirtioNetHdr, pkt: parse.Packet, data: []const u8, by_port: bool) HandoffResult {
+            var complete: [pool.max_super_packet]u8 = undefined;
+            if (data.len > complete.len) return .none;
+            @memcpy(complete[0..data.len], data);
+            gso.completeChecksum(complete[0..data.len], vh) catch return .none;
+            const parsed = parse.parse(complete[0..data.len]) catch return .none;
+            _ = pkt;
+            return classifyAndHandoff(w, parsed, complete[0..data.len], by_port);
+        }
+
+        /// Rare slow path for UDP GSO; ordinary datagrams do not reserve a large stack frame.
+        fn handToHostGso(w: *W, vh: gso.VirtioNetHdr, data: []const u8) HandoffResult {
+            var seg = gso.Segmenter.init(data, vh, true) catch return .none;
+            var handled = false;
+            var out: [pool.max_super_packet]u8 = undefined;
+            var next = seg.next(&out) catch return .none;
+            while (next) |segment| {
+                const sp = parse.parse(segment) catch return if (handled) .handled else .none;
+                const result = classifyAndHandoff(w, sp, segment, true);
+                switch (result) {
+                    .handled, .proxy => handled = true,
+                    .bypass => return if (handled) .handled else .bypass,
+                    .none => return if (handled) .handled else .none,
+                }
+                next = seg.next(&out) catch return if (handled) .handled else .none;
+            }
+            return if (handled) .handled else .none;
+        }
+
+        /// Handoff a datagram, splitting UDP GSO into ordinary datagrams first.
+        fn handToHost(w: *W, vh: gso.VirtioNetHdr, pkt: parse.Packet, data: []const u8) HandoffResult {
+            const ic = w.engine.udpIntercept();
+            const by_port = ic.match(pkt.l4.udp.dst_port);
+            if (!by_port and ic.filter == null) return .none;
+            if (vh.gsoKind() == gso.VirtioNetHdr.gso_udp_l4) {
+                // The application filter cannot classify a coalesced packet; leave
+                // it on the normal handler path unless a configured port matched.
+                if (!by_port) return .none;
+                return handToHostGso(w, vh, data);
+            }
+            if (vh.needsCsum()) return handToHostPartial(w, vh, pkt, data, by_port);
+            return classifyAndHandoff(w, pkt, data, by_port);
+        }
+
         pub fn input(u: *Self, w: *W, b: *pool.Buffer, vh: gso.VirtioNetHdr, pkt: parse.Packet) void {
             var handed = false;
             defer if (!handed) w.pool.put(b);
             const data = b.bytes();
+            var handoff_bypass = false;
+            var handoff_verdict_done = false;
             if (!u.enabled) {
                 icmp.sendUnreachable(w, data, pkt, true);
                 return;
@@ -114,8 +217,20 @@ pub fn Udp(comptime W: type) type {
                     key.dst_port = uh.dst_port;
                 },
             }
+            const existing = u.sessions.find(&key);
+            if (existing == null and w.engine.udpIntercept().active()) {
+                switch (Self.handToHost(w, vh, pkt, data)) {
+                    .handled => return,
+                    .bypass => {
+                        handoff_bypass = true;
+                        handoff_verdict_done = true;
+                    },
+                    .proxy => handoff_verdict_done = true,
+                    .none => {},
+                }
+            }
             const now = w.now();
-            const idx = u.sessions.find(&key) orelse blk: {
+            const idx = existing orelse blk: {
                 if (w.elasticLive()) {
                     if (w.peerOwner(.udp, &key) orelse w.newFlowTarget(key.hash())) |owner| {
                         handed = true;
@@ -133,8 +248,8 @@ pub fn Udp(comptime W: type) type {
                         return;
                     }
                 }
-                var bypass = false;
-                if (w.judge().active()) {
+                var bypass = handoff_bypass;
+                if (!handoff_verdict_done and w.judge().active()) {
                     switch (w.judge().ask(parse.proto.udp, v6, pkt.ip.src(data), uh.src_port, pkt.ip.dst(data), uh.dst_port)) {
                         .proxy => {},
                         .direct => bypass = true,

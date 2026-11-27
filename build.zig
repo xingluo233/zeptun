@@ -277,9 +277,26 @@ pub fn build(b: *std.Build) void {
         const engine_tests = b.addTest(.{ .root_module = main.engine, .filters = test_filters });
         const ffi_tests = b.addTest(.{ .root_module = main.ffi, .filters = test_filters });
         const cli_tests = b.addTest(.{ .root_module = cli_mod, .filters = test_filters });
+        const handoff_header = b.addTranslateC(.{
+            .root_source_file = b.path("src/tests/zeptun_header.c"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needsLibc(target.result),
+        });
+        handoff_header.addIncludePath(b.path("include"));
+        const handoff_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests/handoff_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needsLibc(target.result),
+            .strip = strip,
+        });
+        handoff_mod.addImport("zeptun", main.engine);
+        handoff_mod.addImport("c_abi", handoff_header.createModule());
+        const handoff_tests = b.addTest(.{ .root_module = handoff_mod, .filters = test_filters });
         const test_step = b.step("test", "Run unit tests");
         const test_compile_step = b.step("test-compile", "Compile unit tests without running them, for cross targets");
-        for ([_]*std.Build.Step.Compile{ engine_tests, ffi_tests, cli_tests }) |t| {
+        for ([_]*std.Build.Step.Compile{ engine_tests, ffi_tests, cli_tests, handoff_tests }) |t| {
             test_step.dependOn(&b.addRunArtifact(t).step);
             test_compile_step.dependOn(&t.step);
         }

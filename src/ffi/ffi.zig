@@ -32,6 +32,11 @@ pub const version_patch = 3;
 pub const Packet = external.Packet;
 pub const PacketsFn = external.OutputFn;
 pub const ProtectFn = *const fn (ctx: ?*anyopaque, fd: c_int) callconv(.c) bool;
+pub const UdpMeta = zeptun.intercept.Meta;
+pub const UdpFn = zeptun.intercept.Fn;
+pub const UdpFilterFn = zeptun.intercept.Filter;
+pub const TcpMeta = zeptun.intercept.TcpMeta;
+pub const TcpFn = zeptun.intercept.TcpFn;
 pub const LogFn = *const fn (ctx: ?*anyopaque, level: c_int, message: [*]const u8, len: usize) callconv(.c) void;
 
 pub const Config = extern struct {
@@ -310,6 +315,66 @@ fn logBridge(_: ?*anyopaque, level: log.Level, message: []const u8) void {
     if (log_cb) |f| f(log_ctx, @backingInt(level), message.ptr, message.len);
 }
 
+export fn zeptun_set_udp_callback(tun: ?*anyopaque, cb: ?UdpFn, ctx: ?*anyopaque) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    h.engine.setUdpCallback(cb, ctx) catch |err| return code(errors.fromError(err));
+    return code(.ok);
+}
+
+export fn zeptun_set_tcp_callback(tun: ?*anyopaque, cb: ?TcpFn, ctx: ?*anyopaque) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    h.engine.setTcpCallback(cb, ctx) catch |err| return code(errors.fromError(err));
+    return code(.ok);
+}
+
+export fn zeptun_set_tcp_intercept_ports(tun: ?*anyopaque, ports: ?[*]const u16, count: usize) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    if (count == 0) {
+        h.engine.setTcpInterceptPorts(&.{}) catch |err| return code(errors.fromError(err));
+        return code(.ok);
+    }
+    const p = ports orelse return code(.invalid_argument);
+    h.engine.setTcpInterceptPorts(p[0..count]) catch |err| return code(errors.fromError(err));
+    return code(.ok);
+}
+
+export fn zeptun_set_udp_filter_callback(tun: ?*anyopaque, cb: ?UdpFilterFn, ctx: ?*anyopaque) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    h.engine.setUdpFilter(cb, ctx) catch |err| return code(errors.fromError(err));
+    return code(.ok);
+}
+
+export fn zeptun_set_udp_intercept_ports(tun: ?*anyopaque, ports: ?[*]const u16, count: usize) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    if (count == 0) {
+        h.engine.setUdpInterceptPorts(&.{}) catch |err| return code(errors.fromError(err));
+        return code(.ok);
+    }
+    const p = ports orelse return code(.invalid_argument);
+    h.engine.setUdpInterceptPorts(p[0..count]) catch |err| return code(errors.fromError(err));
+    return code(.ok);
+}
+
+/// Write raw IP packets back to the tunnel so they reach the client.
+/// Safe to call from any thread, including from inside the UDP callback.
+export fn zeptun_send_packet(tun: ?*anyopaque, data: ?[*]const u8, len: usize) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    const d = data orelse return code(.invalid_argument);
+    h.engine.sendPacket(d[0..len]) catch |err| return code(switch (err) {
+        error.TooLarge => .invalid_argument,
+        error.Full => .would_block,
+        error.Closed => .closed,
+    });
+    return code(.ok);
+}
+
+export fn zeptun_send_packets(tun: ?*anyopaque, packets: ?[*]const Packet, count: usize) callconv(.c) c_int {
+    const h = handleOf(tun) orelse return code(.invalid_argument);
+    if (count == 0) return 0;
+    const p = packets orelse return code(.invalid_argument);
+    const n = h.engine.sendPackets(p[0..count]);
+    return @intCast(@min(n, std.math.maxInt(c_int)));
+}
 export fn zeptun_set_log_callback(cb: ?LogFn, ctx: ?*anyopaque, level: c_int) callconv(.c) c_int {
     log_ctx = ctx;
     log_cb = cb;

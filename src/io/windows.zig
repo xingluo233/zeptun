@@ -428,6 +428,41 @@ pub fn setNonblocking(fd: fd_t) !void {
     if (ws2_32.ioctlsocket(fd, FIONBIO, &one) == SOCKET_ERROR) return error.Unexpected;
 }
 
+pub fn setBlocking(fd: fd_t) !void {
+    var zero: u32 = 0;
+    if (ws2_32.ioctlsocket(fd, FIONBIO, &zero) == SOCKET_ERROR) return error.Unexpected;
+}
+
+/// Windows has no socketpair. Build the same shape from a loopback listener
+/// with one pending connection: both ends are stream sockets over AF_INET on
+/// 127.0.0.1, so overlapped I/O works and no network traffic leaves the host.
+pub fn socketpair() ![2]fd_t {
+    const l = try socket(.v4, .tcp);
+    defer closeSocket(l);
+
+    var sa = Sockaddr.fromEndpoint(try addr.Endpoint.parse("127.0.0.1:0"));
+    if (bind(l, &sa) != 0) return error.Unexpected;
+    if (listen(l, 1) != 0) return error.Unexpected;
+    if (getsockname(l, &sa) != 0) return error.Unexpected;
+
+    const cli = try socket(.v4, .tcp);
+    errdefer closeSocket(cli);
+    // A loopback connect completes immediately, so do it blocking.
+    try setBlocking(cli);
+    if (connect(cli, &sa) != 0) return error.Unexpected;
+    try setNonblocking(cli);
+
+    // Use the native SOCKET-returning accept here. The generic sys.accept
+    // wrapper returns an i32 completion result for the event-loop API, which
+    // must not narrow this host-owned handle.
+    const srv = ws2_32.accept(l, null, null);
+    if (srv == INVALID_SOCKET) return error.Unexpected;
+    errdefer closeSocket(srv);
+    if (kernel32.SetHandleInformation(@ptrFromInt(srv), HANDLE_FLAG_INHERIT, 0) == 0) return error.Unexpected;
+    try setNonblocking(srv);
+    return .{ cli, srv };
+}
+
 pub fn setsockopt(fd: fd_t, level: i32, opt: u32, value: []const u8) i32 {
     if (ws2_32.setsockopt(fd, level, @bitCast(opt), value.ptr, clampLen(value.len)) == SOCKET_ERROR) return lastErrno().result();
     return 0;

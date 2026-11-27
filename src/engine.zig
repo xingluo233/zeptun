@@ -18,6 +18,7 @@ const handler_mod = @import("handler/handler.zig");
 const route = @import("route/route.zig");
 const parse = @import("packet/parse.zig");
 const elastic = @import("elastic.zig");
+const intercept = @import("intercept.zig");
 
 pub const State = enum(u8) { created, running, stopping, stopped };
 
@@ -353,6 +354,22 @@ pub fn Worker(comptime L: type) type {
             }
         }
 
+        /// Deliver packets the host queued through Engine.sendPackets.
+        /// The MPSC queue has a single consumer, so only worker 0 drains it.
+        fn drainUdpInject(w: *Self) bool {
+            if (w.id != 0) return false;
+            const s = w.engine.udp_inject orelse return false;
+            var n: usize = 0;
+            while (n < 2048) : (n += 1) {
+                const b = s.inbound.pop() orelse break;
+                const len = b.len;
+                Self.injectToDevice(w, b);
+                w.counters.inc(.tx_packets);
+                w.counters.add(.tx_bytes, len);
+            }
+            return n > 0;
+        }
+
         fn onControl(w: *Self, b: *pool.Buffer) void {
             switch (@as(elastic.Control, @fromBackingInt(@intCast(b.meta)))) {
                 .tcp_transfer => if (has_userspace_tcp) w.tcp.install(w, b) else w.pool.put(b),
@@ -513,6 +530,7 @@ pub fn Worker(comptime L: type) type {
             if (has_passthrough) {
                 if (w.passthrough) |*p| p.poll(w);
             }
+            if (w.drainUdpInject()) worked = true;
             if (w.pool.remote.load(.unordered) != null) _ = w.pool.drainRemote();
             return worked;
         }
@@ -866,6 +884,8 @@ pub const Workers = union(io.BackendKind) {
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     cfg: config.Config,
+    /// Serializes startup with pre-start-only callback/port configuration.
+    config_lock: queue.SpinLock = .{},
     state: std.atomic.Value(State) = .init(.created),
     backend: io.BackendKind = .epoll,
     device_kind: config.DeviceKind = .tun,
@@ -884,6 +904,9 @@ pub const Engine = struct {
     passthrough_shared: ?*device.external.Shared = null,
     protect: handler_mod.direct.Protect = .{},
     judge: verdict.Judge = .{},
+    udp_intercept: intercept.State = .{},
+    tcp_intercept: intercept.TcpState = .{},
+    udp_inject: ?*device.external.Shared = null,
     route_state: route.State = .{},
     netns: route.netns.Handle = .{},
     workers: ?Workers = null,
@@ -960,6 +983,92 @@ pub const Engine = struct {
     pub fn setProtect(e: *Engine, f: ?*const fn (ctx: ?*anyopaque, fd: c_int) callconv(.c) bool, ctx: ?*anyopaque) void {
         e.protect.android_fn = f;
         e.protect.android_ctx = ctx;
+    }
+
+    /// Register the UDP interception callback. Datagrams whose destination port
+    /// matches the filter are handed to `f` instead of being proxied.
+    pub fn setUdpCallback(e: *Engine, f: ?intercept.Fn, ctx: ?*anyopaque) !void {
+        e.config_lock.lock();
+        defer e.config_lock.unlock();
+        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+        if (f != null and e.cfg.handler.kind == .passthrough) return error.NotSupported;
+        if (f == null) {
+            e.udp_intercept.call = null;
+            e.udp_intercept.ctx = null;
+            return;
+        }
+        if (e.udp_inject == null) {
+            const s = try device.external.Shared.init(e.allocator, e.cfg.device.mtu, 2048);
+            s.wake = wakeFirst;
+            s.wake_ctx = e;
+            e.udp_inject = s;
+        }
+        e.udp_intercept.call = f;
+        e.udp_intercept.ctx = ctx;
+    }
+
+    /// Restrict interception to these destination ports. An empty list means every port.
+    pub fn setUdpInterceptPorts(e: *Engine, list: []const u16) intercept.Error!void {
+        e.config_lock.lock();
+        defer e.config_lock.unlock();
+        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+        try e.udp_intercept.setPorts(list);
+    }
+
+    /// Second-stage filter for datagrams whose port did not match.
+    /// The host inspects the payload and returns non-zero to take the datagram.
+    pub fn setUdpFilter(e: *Engine, f: ?intercept.Filter, ctx: ?*anyopaque) !void {
+        e.config_lock.lock();
+        defer e.config_lock.unlock();
+        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+        e.udp_intercept.setFilter(f, ctx);
+    }
+
+    /// Register the stream handoff callback. Connections whose destination port
+    /// matches the filter are handed to `f` as a stream socket instead of being
+    /// proxied.
+    pub fn setTcpCallback(e: *Engine, f: ?intercept.TcpFn, ctx: ?*anyopaque) !void {
+        e.config_lock.lock();
+        defer e.config_lock.unlock();
+        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+        if (f != null and (e.cfg.stack.mode != .userspace or e.cfg.handler.kind == .passthrough)) return error.NotSupported;
+        if (f == null) {
+            e.tcp_intercept.call = null;
+            e.tcp_intercept.ctx = null;
+            return;
+        }
+        e.tcp_intercept.call = f;
+        e.tcp_intercept.ctx = ctx;
+    }
+
+    pub fn setTcpInterceptPorts(e: *Engine, list: []const u16) intercept.Error!void {
+        e.config_lock.lock();
+        defer e.config_lock.unlock();
+        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+        try e.tcp_intercept.setPorts(list);
+    }
+
+    pub inline fn tcpIntercept(e: *const Engine) *const intercept.TcpState {
+        return &e.tcp_intercept;
+    }
+
+    pub inline fn udpIntercept(e: *const Engine) *const intercept.State {
+        return &e.udp_intercept;
+    }
+
+    /// Hand one raw IP packet back to the tunnel, as if it had arrived from upstream.
+    /// Thread safe: may be called from any host thread, including the callback.
+    pub fn sendPacket(e: *Engine, data: []const u8) device.external.InjectError!void {
+        const s = e.udp_inject orelse return error.Closed;
+        try s.inject(data);
+        s.notify();
+    }
+
+    /// Hand raw IP packets back to the tunnel. Returns the number accepted.
+    /// Thread safe: may be called from any host thread, including the callback.
+    pub fn sendPackets(e: *Engine, packets: []const device.external.Packet) usize {
+        const s = e.udp_inject orelse return 0;
+        return s.injectBatch(packets);
     }
 
     pub fn setAdapterGuid(e: *Engine, text: []const u8) !void {
@@ -1326,9 +1435,13 @@ pub const Engine = struct {
     }
 
     pub fn start(e: *Engine) !void {
-        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
-        try e.setup();
-        e.enterRunning();
+        {
+            e.config_lock.lock();
+            defer e.config_lock.unlock();
+            if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+            try e.setup();
+            e.enterRunning();
+        }
         errdefer {
             e.requestStop();
             e.wait();
@@ -1390,15 +1503,20 @@ pub const Engine = struct {
     }
 
     pub fn run(e: *Engine) !void {
-        if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
-        try e.setup();
+        // Route setup requires worker threads; use the regular start path before
+        // taking any setup locks so state never has to be rolled back to created.
         if (e.needsRoutes() and can_spawn_threads) {
-            e.state.store(.created, .release);
             try e.start();
             e.wait();
             return;
         }
-        e.enterRunning();
+        {
+            e.config_lock.lock();
+            defer e.config_lock.unlock();
+            if (e.state.load(.acquire) != .created) return error.AlreadyRunning;
+            try e.setup();
+            e.enterRunning();
+        }
         switch (e.workers.?) {
             inline else => |list, tag| {
                 if (comptime WorkerFor(tag) != void) {
@@ -1421,6 +1539,7 @@ pub const Engine = struct {
 
     pub fn requestStop(e: *Engine) void {
         e.stop_requested.store(true, .release);
+        if (e.udp_inject) |s| s.close();
         if (e.state.cmpxchgStrong(.running, .stopping, .acquire, .acquire) != null) return;
         e.wakeAll();
     }
@@ -1432,7 +1551,7 @@ pub const Engine = struct {
 
     pub fn stop(e: *Engine) void {
         e.requestStop();
-        if (e.external) |s| s.closed.store(true, .release);
+        if (e.external) |s| s.close();
     }
 
     pub fn wait(e: *Engine) void {
@@ -1483,6 +1602,7 @@ pub const Engine = struct {
         e.netns.close();
         e.closeRedirectListeners();
         if (e.opened) |*o| o.close();
+        if (e.udp_inject) |s| s.deinit();
         if (e.external) |s| s.deinit();
         if (e.passthrough_shared) |s| s.deinit();
         if (e.fake_dns) |t| t.deinit();
